@@ -26,7 +26,7 @@ import scala.util.Success
 import scala.util.Try
 import scala.util.matching.Regex
 
-class MinimalRepro extends AnyFunSuite with Matchers with BeforeAndAfterAll {
+class OldVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   implicit val system: ActorSystem = ActorSystem()
   implicit val materializer: ActorMaterializer = ActorMaterializer()
   implicit val schema: Schema[String] = Schema.STRING

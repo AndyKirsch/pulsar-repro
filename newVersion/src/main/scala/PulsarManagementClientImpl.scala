@@ -1,12 +1,7 @@
 import akka.Done
-import akka.actor.ActorSystem
-import akka.actor.Scheduler
-import akka.pattern.retry
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.blocking
-import scala.concurrent.duration.DurationInt
-import scala.concurrent.duration.FiniteDuration
 
 import play.api.libs.json.JsValue
 import play.api.libs.json.Json
@@ -112,6 +107,7 @@ class PulsarManagementClientImpl(
     for {
       resp <- url(adminPrefix + "namespaces/" + tenantNamespace).put(body)
       _ <- validateResponse(resp, Set(200, 204, 409)) // 409 means already created
+
     } yield Done
   }
 
@@ -146,6 +142,7 @@ class PulsarManagementClientImpl(
                                   status: Set[Int],
                                 ): Future[Done] = {
     if (status(response.status)) {
+      println(s"Status was ${response.status}")
       Future.successful(Done)
     } else {
       Future.failed(
@@ -163,5 +160,31 @@ class PulsarManagementClientImpl(
       case topicNameRegex(topicType, tenantNamespaceTopic) => Some((topicType, tenantNamespaceTopic))
       case _ => None
     }
+  }
+
+  def deleteTenant(tenantName: String): Future[Boolean] = {
+    for {
+      resp <- url(adminPrefix + "tenants/" + tenantName).delete()
+      _ <- validateResponse(resp, Set(200, 204))
+    } yield true
+  }
+
+  def deleteTopic(topicName: String): Future[Boolean] = {
+    parseTopicName(topicName) match {
+      case Some((topicType, tenantNamespaceTopic)) =>
+        for {
+          resp <- url(adminPrefix + topicType + "/" + tenantNamespaceTopic).delete()
+          _ <- validateResponse(resp, Set(200, 204))
+        } yield true
+      case _ =>
+        Future.successful(false)
+    }
+  }
+
+  def deleteNamespace(tenantNamespace: String): Future[Boolean] = {
+    for {
+      resp <- url(adminPrefix + "namespaces/" + tenantNamespace + "?force=true").delete()
+      _ <- validateResponse(resp, Set(200, 204))
+    } yield true
   }
 }
