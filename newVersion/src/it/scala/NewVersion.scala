@@ -42,9 +42,14 @@ class NewVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   private val client = PulsarClient("pulsar://localhost:6650")
   private val iterableConfig = new PulsarConfig(url = "pulsar://localhost:6650", managementUrl = "http://localhost:9090")
   private val managementClient = new PulsarManagementClientImpl(iterableConfig, WSClient, executor)
+  val tenant = "stuff"
 
-  def send(topicRoot: String = "persistent://repro/ns1/sourcetest_"): Topic = {
-    val topic = Topic(topicRoot + UUID.randomUUID)
+  def send(topicRoot: String = s"persistent://$tenant/ns1/sourcetest_"): Topic = {
+    sendExact(topicRoot + UUID.randomUUID)
+  }
+
+  def sendExact(topicStr: String): Topic = {
+    val topic = Topic(topicStr)
     val config = ProducerConfig(topic)
     val producer = client.producer(config)
     val receipt = producer.send("test")
@@ -68,7 +73,18 @@ class NewVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
       ConsumerConfig(
         topicPattern = Some(regex),
         subscriptionName = Subscription.generate,
-        subscriptionInitialPosition = Some(SubscriptionInitialPosition.Earliest)
+        subscriptionInitialPosition = Some(SubscriptionInitialPosition.Earliest),
+        patternAutoDiscoveryPeriod = Some(1.seconds)
+      ))
+  }
+
+  def topicConsumer(topic: String): Consumer[String] = {
+    client.consumer(
+      ConsumerConfig(
+        topics = Seq(Topic(topic)),
+        subscriptionName = Subscription.generate,
+        subscriptionInitialPosition = Some(SubscriptionInitialPosition.Earliest),
+        patternAutoDiscoveryPeriod = Some(1.seconds)
       ))
   }
 
@@ -81,41 +97,48 @@ class NewVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("regex subscription not partitioned") {
-    val result = patternConsumer("repro/ns1/sourcetest_.*".r).receiveAsync
+    val result = patternConsumer(s"$tenant/ns1/sourcetest_.*".r).receiveAsync
     send()
 
     await(result)(timeout)
   }
 
   test("regex subscription 1 partition, exact match") {
-    val topic = send("persistent://repro/ns2/sourcetest_")
+    val topic = send(s"persistent://$tenant/ns2/sourcetest_")
     val result = patternConsumer(topic.name.replace("persistent://", "").r).receive(timeout)
     assertGotAMessage(result)
   }
 
   test("regex subscription 1 partition") {
-    val result = patternConsumer("repro/ns2/sourcetest_.*".r).receiveAsync
-    send("persistent://repro/ns2/sourcetest_")
+    val result = patternConsumer(s"$tenant/ns2/sourcetest_.*".r).receiveAsync
+    send(s"persistent://$tenant/ns2/sourcetest_")
 
     await(result)(timeout)
   }
 
   test("regex subscription 2 partitions, exact match") {
-    val topic = send("persistent://repro/ns3/sourcetest_")
+    val topic = send(s"persistent://$tenant/ns3/sourcetest_")
     val result = patternConsumer(topic.name.replace("persistent://", "").r).receive(timeout)
     assertGotAMessage(result)
   }
 
   test("regex subscription 2 partitions") {
-    val result = patternConsumer("repro/ns3/sourcetest_.*".r).receiveAsync
-    send("persistent://repro/ns3/sourcetest_")
+    val result = patternConsumer(s"$tenant/ns3/sourcetest_.*".r).receiveAsync
+    send(s"persistent://$tenant/ns3/sourcetest_")
 
     await(result)(timeout)
   }
 
-  test("regex subscription 2 partitions, ns4") {
-    val result = patternConsumer("repro/ns4/sourcetest_.*".r).receiveAsync
-    send("persistent://repro/ns4/sourcetest_")
+  test("regex subscription partitioned, exact match") {
+    val result = patternConsumer(s"$tenant/ns4/sourcetest".r).receiveAsync
+    val topic = sendExact(s"persistent://$tenant/ns4/sourcetest")
+
+    await(result)(timeout)
+  }
+
+  test("regex subscription partitioned, produce then consume") {
+    val result = patternConsumer(s"$tenant/ns5/sourc.test".r).receiveAsync
+    val topic = sendExact(s"persistent://$tenant/ns5/sourcetest")
 
     await(result)(timeout)
   }
@@ -133,11 +156,12 @@ class NewVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   override def beforeAll(): Unit = {
     super.beforeAll()
     await(for {
-      _ <- managementClient.createTenant("repro")
-      _ <- managementClient.createNamespace("repro/ns1", None) // Not partitioned
-      _ <- managementClient.createNamespace("repro/ns2", Some(1)) // 1 partition
-      _ <- managementClient.createNamespace("repro/ns3", Some(2)) // 2 partitions
-      _ <- managementClient.createNamespace("repro/ns4", Some(2)) // 2 partitions
+      _ <- managementClient.createTenant(tenant)
+      _ <- managementClient.createNamespace(s"$tenant/ns1", None) // Not partitioned
+      _ <- managementClient.createNamespace(s"$tenant/ns2", Some(1)) // 1 partition
+      _ <- managementClient.createNamespace(s"$tenant/ns3", Some(2)) // 2 partitions
+      _ <- managementClient.createNamespace(s"$tenant/ns4", Some(2)) // 2 partitions
+      _ <- managementClient.createNamespace(s"$tenant/ns5", Some(2)) // 2 partitions
     } yield ())(10.seconds)
   }
 
@@ -187,7 +211,7 @@ class NewVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
   override def afterAll(): Unit = {
     super.afterAll()
-    cleanupPulsarTenant(managementClient, "repro")
+    cleanupPulsarTenant(managementClient, tenant, true)
     client.close()
     WSClient.close()
   }

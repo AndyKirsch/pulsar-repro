@@ -14,7 +14,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 import play.api.libs.ws.ahc.AhcWSClientProvider
 import play.api.libs.ws.ahc.StandaloneAhcWSClient
-import play.api.test.Helpers.await
+import play.api.test.Helpers.{await, defaultAwaitTimeout}
 import play.shaded.ahc.org.asynchttpclient.AsyncHttpClient
 import play.shaded.ahc.org.asynchttpclient.DefaultAsyncHttpClient
 
@@ -42,9 +42,14 @@ class OldVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   private val client = PulsarClient("pulsar://localhost:6650")
   private val iterableConfig = new PulsarConfig(url = "pulsar://localhost:6650", managementUrl = "http://localhost:9090")
   private val managementClient = new PulsarManagementClientImpl(iterableConfig, WSClient, executor)
+  val tenant = "oldversion"
 
-  def send(topicRoot: String = "persistent://repro/ns1/sourcetest_"): Topic = {
-    val topic = Topic(topicRoot + UUID.randomUUID)
+  def send(topicRoot: String = s"persistent://$tenant/ns1/sourcetest_"): Topic = {
+    sendExact(topicRoot + UUID.randomUUID)
+  }
+
+  def sendExact(topicStr: String): Topic = {
+    val topic = Topic(topicStr)
     val config = ProducerConfig(topic)
     val producer = client.producer(config)
     val receipt = producer.send("test")
@@ -68,7 +73,18 @@ class OldVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
       ConsumerConfig(
         topicPattern = Some(regex),
         subscriptionName = Subscription.generate,
-        subscriptionInitialPosition = Some(SubscriptionInitialPosition.Earliest)
+        subscriptionInitialPosition = Some(SubscriptionInitialPosition.Earliest),
+        patternAutoDiscoveryPeriod = Some(1.seconds)
+      ))
+  }
+
+  def topicConsumer(topic: String): Consumer[String] = {
+    client.consumer(
+      ConsumerConfig(
+        topics = Seq(Topic(topic)),
+        subscriptionName = Subscription.generate,
+        subscriptionInitialPosition = Some(SubscriptionInitialPosition.Earliest),
+        patternAutoDiscoveryPeriod = Some(1.seconds)
       ))
   }
 
@@ -81,41 +97,48 @@ class OldVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("regex subscription not partitioned") {
-    val result = patternConsumer("repro/ns1/sourcetest_.*".r).receiveAsync
+    val result = patternConsumer(s"$tenant/ns1/sourcetest_.*".r).receiveAsync
     send()
 
     await(result)(timeout)
   }
 
   test("regex subscription 1 partition, exact match") {
-    val topic = send("persistent://repro/ns2/sourcetest_")
+    val topic = send(s"persistent://$tenant/ns2/sourcetest_")
     val result = patternConsumer(topic.name.replace("persistent://", "").r).receive(timeout)
     assertGotAMessage(result)
   }
 
   test("regex subscription 1 partition") {
-    val result = patternConsumer("repro/ns2/sourcetest_.*".r).receiveAsync
-    send("persistent://repro/ns2/sourcetest_")
+    val result = patternConsumer(s"$tenant/ns2/sourcetest_.*".r).receiveAsync
+    send(s"persistent://$tenant/ns2/sourcetest_")
 
     await(result)(timeout)
   }
 
   test("regex subscription 2 partitions, exact match") {
-    val topic = send("persistent://repro/ns3/sourcetest_")
+    val topic = send(s"persistent://$tenant/ns3/sourcetest_")
     val result = patternConsumer(topic.name.replace("persistent://", "").r).receive(timeout)
     assertGotAMessage(result)
   }
 
   test("regex subscription 2 partitions") {
-    val result = patternConsumer("repro/ns3/sourcetest_.*".r).receiveAsync
-    send("persistent://repro/ns3/sourcetest_")
+    val result = patternConsumer(s"$tenant/ns3/sourcetest_.*".r).receiveAsync
+    send(s"persistent://$tenant/ns3/sourcetest_")
 
     await(result)(timeout)
   }
 
-  test("regex subscription 2 partitions, ns4") {
-    val result = patternConsumer("repro/ns4/sourcetest_.*".r).receiveAsync
-    send("persistent://repro/ns4/sourcetest_")
+  test("regex subscription partitioned, exact match") {
+    val result = patternConsumer(s"$tenant/ns4/sourcetest".r).receiveAsync
+    val topic = sendExact(s"persistent://$tenant/ns4/sourcetest")
+
+    await(result)(timeout)
+  }
+
+  test("regex subscription partitioned, produce then consume") {
+    val result = patternConsumer(s"$tenant/ns5/sourc.test".r).receiveAsync
+    val topic = sendExact(s"persistent://$tenant/ns5/sourcetest")
 
     await(result)(timeout)
   }
@@ -133,16 +156,62 @@ class OldVersion extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   override def beforeAll(): Unit = {
     super.beforeAll()
     await(for {
-      _ <- managementClient.createTenant("repro")
-      _ <- managementClient.createNamespace("repro/ns1", None) // Not partitioned
-      _ <- managementClient.createNamespace("repro/ns2", Some(1)) // 1 partition
-      _ <- managementClient.createNamespace("repro/ns3", Some(2)) // 2 partitions
-      _ <- managementClient.createNamespace("repro/ns4", Some(2)) // 2 partitions
+      _ <- managementClient.createTenant(tenant)
+      _ <- managementClient.createNamespace(s"$tenant/ns1", None) // Not partitioned
+      _ <- managementClient.createNamespace(s"$tenant/ns2", Some(1)) // 1 partition
+      _ <- managementClient.createNamespace(s"$tenant/ns3", Some(2)) // 2 partitions
+      _ <- managementClient.createNamespace(s"$tenant/ns4", Some(2)) // 2 partitions
+      _ <- managementClient.createNamespace(s"$tenant/ns5", Some(2)) // 2 partitions
     } yield ())(10.seconds)
   }
 
+
+  def cleanupPulsarTenant(pulsarClient: PulsarManagementClientImpl, tenantName: String, deleteTenant: Boolean = false): Boolean = {
+    val tenants = await(pulsarClient.getTenants())
+
+    if (tenants.contains(tenantName)) {
+      val namespaces = await(pulsarClient.getNamespaces(tenantName))
+      val namespaceDeleteResults = namespaces.map { namespace =>
+        val topics = await(pulsarClient.getTopics(namespace))
+        val topicDeleteResults = topics.filterNot(_.contains("__change_events")).map { topic =>
+          Try(await(pulsarClient.deleteTopic(topic))) match {
+            case Success(_) =>
+              println(s"deleted Pulsar topic $topic")
+              true
+            case Failure(ex) =>
+              println(s"failed to delete Pulsar topic $topic", ex)
+              false
+          }
+        }
+        Try(await(pulsarClient.deleteNamespace(namespace))) match {
+          case Success(_) =>
+            println(s"deleted Pulsar namespace $namespace")
+            topicDeleteResults.forall(x => x)
+          case Failure(ex) =>
+            println(s"failed to delete Pulsar namespace $namespace", ex)
+            false
+        }
+      }
+      if (deleteTenant) {
+        Try(await(pulsarClient.deleteTenant(tenantName))) match {
+          case Success(result) =>
+            println(s"deleted Pulsar tenant $tenantName")
+            namespaceDeleteResults.forall(x => x)
+          case Failure(ex) =>
+            println(s"failed to delete Pulsar tenant $tenantName", ex)
+            false
+        }
+      } else {
+        true
+      }
+    } else {
+      println(s"tenant $tenantName doesn't exist, there is nothing to delete")
+      true
+    }
+  }
   override def afterAll(): Unit = {
     super.afterAll()
+    cleanupPulsarTenant(managementClient, tenant, true)
     client.close()
     WSClient.close()
   }
